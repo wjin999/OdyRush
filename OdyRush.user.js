@@ -1,17 +1,21 @@
 // ==UserScript==
 // @name         OdyRush - Grand Cinema Sunshine
 // @namespace    https://github.com/wjin999/OdyRush
-// @version      0.5.1
-// @description  为 Grand Cinema Sunshine 池袋分析并自动选择最佳连续座位。
+// @version      0.6.0
+// @description  按池袋 IMAX 12 号厅布局自动分析并选择连座，支持中央区域/全场和高级座位开关。
 // @author       OdyRush
 // @match        https://transaction.ticket-cinemasunshine.com/*
 // @match        https://login.member.cinemasunshine.co.jp/*
 // @match        https://www.cinemasunshine.co.jp/theater/gdcs/*
 // @match        https://portal.cinemasunshine.smart-spoke.com/*
-// @run-at       document-idle
+// @run-at       document-start
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_openInTab
 // @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_getTab
+// @grant        GM_saveTab
 // @grant        window.close
 // @grant        window.onurlchange
 // ==/UserScript==
@@ -26,12 +30,12 @@
   }
 
   if (typeof window !== "undefined" && typeof document !== "undefined") {
-    api.start();
+    api.start().catch((error) => console.error("OdyRush:", error));
   }
 })(function odyRushFactory() {
   "use strict";
 
-  const VERSION = "0.5.1";
+  const VERSION = "0.6.0";
   const TARGET_HOST = "transaction.ticket-cinemasunshine.com";
   const MEMBER_LOGIN_HOST = "login.member.cinemasunshine.co.jp";
   const TARGET_SCHEDULE_HOSTS = new Set([
@@ -44,42 +48,23 @@
   const PANEL_ID = "odyrush-panel-host";
   const RECOMMENDED_ATTRIBUTE = "data-odyrush-recommended";
   const STORAGE_KEY = "odyrush.settings.v1";
-  const TARGET_SESSION_KEY = "odyrush.target.gdcs";
-  const TARGET_INTENT_KEY = "odyrush.target-intent.gdcs.v1";
-  const TARGET_INTENT_TTL_MILLISECONDS = 6 * 60 * 60 * 1000;
   const MAX_SEATS = 6;
-  const AUTO_SUCCESS_KEY = "odyrush.auto-success.v1";
+  const AUTO_SUCCESS_KEY = "odyrush.auto-success.v2";
   const AUTO_SUCCESS_TTL_MILLISECONDS = 15 * 60 * 1000;
-
-  const ALWAYS_EXCLUDED_SEAT_CLASSES = [
-    "seat-hc",
-    "seat-comfort",
-    "seat-ottoman",
-    "seat-parent-and-child-pair-left",
-    "seat-parent-and-child-pair-right",
-  ];
-  const FRONT_EXCLUSION_RATIO = 0.36;
-
-  const PREFERENCES = {
-    balanced: {
-      targetRow: 0.66,
-      horizontalWeight: 0.62,
-      verticalWeight: 0.38,
-      centerBlockFirst: true,
-    },
-    center: {
-      targetRow: 0.66,
-      horizontalWeight: 0.86,
-      verticalWeight: 0.14,
-      centerBlockFirst: true,
-    },
-    back: { targetRow: 0.84, horizontalWeight: 0.45, verticalWeight: 0.55 },
-    front: {
-      targetRow: FRONT_EXCLUSION_RATIO,
-      horizontalWeight: 0.45,
-      verticalWeight: 0.55,
-    },
+  const MANAGED_TAB_TTL = 6 * 60 * 60 * 1000;
+  const LAUNCH_KEY = "odyrush.launch.";
+  const IMAX_ROWS = "A B C D E F G H J K M N O P Q R".split(" ");
+  // A viewing preference, not measured viewing angles. Source and rationale: README.
+  const ROW_PENALTIES = {
+    A: 60, B: 54, C: 48, D: 42, E: 36, F: 30, G: 16, H: 10,
+    J: 5, K: 2, M: 0, N: 4, O: 8, P: 13, Q: 18, R: 24,
   };
+  const ALWAYS_EXCLUDED_SEAT_CLASSES = [
+    "seat-hc", "seat-comfort", "seat-ottoman",
+    "seat-parent-and-child-pair-left", "seat-parent-and-child-pair-right",
+  ];
+  let managedTab = null;
+  let activePanel = null;
 
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -159,175 +144,90 @@
     );
   }
 
-  function splitIntoSeatBlocks(rowSeats, normalGap) {
-    const blocks = [];
-    let currentBlock = [];
-
-    for (const seat of rowSeats) {
-      const previous = currentBlock[currentBlock.length - 1];
-      if (
-        previous &&
-        !arePhysicallyContinuous([previous, seat], normalGap)
-      ) {
-        blocks.push(currentBlock);
-        currentBlock = [];
-      }
-      currentBlock.push(seat);
-    }
-
-    if (currentBlock.length > 0) {
-      blocks.push(currentBlock);
-    }
-
-    return blocks;
+  function seatClass(seat) {
+    if (seat.seatClass) return seat.seatClass;
+    if (["G", "N"].includes(seat.row) && seat.number >= 11 && seat.number <= 22) return "premium";
+    if (seat.row === "R" && seat.number >= 11 && seat.number <= 20) return "grand";
+    return "standard";
   }
 
-  function findBestSeats(seats, count, preferenceName = "balanced") {
+  function isCentralSeat(seat) {
+    if (!IMAX_ROWS.slice(6).includes(seat.row)) return false;
+    const last = ["G", "N"].includes(seat.row) ? 22 : seat.row === "R" ? 20 : 30;
+    return seat.number >= 11 && seat.number <= last;
+  }
+
+  function isTheater12Map(seats) {
+    const labels = new Set(seats.map((seat) => seat.label));
+    const rows = new Set(seats.map((seat) => seat.row));
+    return IMAX_ROWS.every((row) => rows.has(row)) && rows.size === IMAX_ROWS.length &&
+      ["G11", "G22", "H1", "H11", "H30", "H40", "J11", "J30", "N11", "N22", "R11", "R20"]
+        .every((label) => labels.has(label)) &&
+      seats.every((seat) => Number.isFinite(seat.x) && Number.isFinite(seat.y)) &&
+      new Set(seats.map((seat) => seat.x)).size > 10 &&
+      new Set(seats.map((seat) => seat.y)).size >= IMAX_ROWS.length;
+  }
+
+  function findBestSeats(seats, count, options = {}) {
     if (!Number.isInteger(count) || count < 1 || count > MAX_SEATS) {
       throw new Error(`人数必须是 1 到 ${MAX_SEATS} 的整数。`);
     }
-
-    const preference = PREFERENCES[preferenceName] || PREFERENCES.balanced;
-    const selectableSeatTypes = seats.filter(
-      (seat) =>
-        !seat.special &&
-        Number.isFinite(seat.x) &&
-        Number.isFinite(seat.y) &&
-        typeof seat.row === "string" &&
-        Number.isFinite(seat.number),
-    );
-
-    if (selectableSeatTypes.length === 0) {
-      return null;
-    }
-
+    const area = options.area === "all" ? "all" : "central";
+    const allowPremium = options.allowPremium === true;
+    const geometry = seats.filter((seat) => Number.isFinite(seat.x) && Number.isFinite(seat.y) &&
+      IMAX_ROWS.includes(seat.row) && Number.isInteger(seat.number));
+    if (!geometry.length) return null;
+    // H is a full standard row in this fixed layout. Premium rows have different numbering.
+    const reference = geometry.filter((seat) => seat.row === "H");
+    const centerLeft = reference.find((seat) => seat.number === 11);
+    const centerRight = reference.find((seat) => seat.number === 30);
+    const minX = Math.min(...geometry.map((seat) => seat.x));
+    const maxX = Math.max(...geometry.map((seat) => seat.x));
+    const centerX = centerLeft && centerRight ? (centerLeft.x + centerRight.x) / 2 : (minX + maxX) / 2;
+    const halfWidth = Math.max(1, centerX - minX, maxX - centerX);
     const rows = new Map();
-    for (const seat of selectableSeatTypes) {
-      if (!rows.has(seat.row)) {
-        rows.set(seat.row, []);
-      }
+    for (const seat of geometry) {
+      if (!rows.has(seat.row)) rows.set(seat.row, []);
       rows.get(seat.row).push(seat);
     }
-
-    const rowMetrics = [...rows.entries()]
-      .map(([row, rowSeats]) => ({
-        row,
-        y: rowSeats.reduce((sum, seat) => sum + seat.y, 0) / rowSeats.length,
-      }))
-      .sort((left, right) => left.y - right.y);
-    const minimumY = rowMetrics[0].y;
-    const maximumY = rowMetrics[rowMetrics.length - 1].y;
-    const rowPosition = new Map(
-      rowMetrics.map((metric) => [
-        metric.row,
-        maximumY === minimumY ? 0.5 : (metric.y - minimumY) / (maximumY - minimumY),
-      ]),
-    );
-
-    const xValues = selectableSeatTypes.map((seat) => seat.x);
-    const minimumX = Math.min(...xValues);
-    const maximumX = Math.max(...xValues);
-    const roomCenterX = (minimumX + maximumX) / 2;
-    const halfRoomWidth = Math.max(1, (maximumX - minimumX) / 2);
     const candidates = [];
-
-    for (const [row, unsortedRowSeats] of rows.entries()) {
-      const rowSeats = [...unsortedRowSeats].sort((left, right) => left.x - right.x);
-      const normalGap = typicalSeatGap(rowSeats);
-      const normalizedRow = rowPosition.get(row);
-
-      if (normalizedRow < FRONT_EXCLUSION_RATIO) {
-        continue;
+    for (const [row, rowSeats] of rows) {
+      rowSeats.sort((a, b) => a.x - b.x);
+      // Premium seats are wider than the standard side blocks in the SAME row.
+      const gapFor = new Map();
+      for (const seat of rowSeats) {
+        const key = `${seatClass(seat)}:${isCentralSeat(seat)}`;
+        if (!gapFor.has(key)) gapFor.set(key, typicalSeatGap(rowSeats.filter((other) =>
+          seatClass(other) === seatClass(seat) && isCentralSeat(other) === isCentralSeat(seat))));
       }
-
-      const seatBlocks = splitIntoSeatBlocks(rowSeats, normalGap);
-      for (const seatBlock of seatBlocks) {
-        const blockMinimumX = seatBlock[0].x;
-        const blockMaximumX = seatBlock[seatBlock.length - 1].x;
-        const centerBlockDistance = clamp(
-          roomCenterX < blockMinimumX
-            ? (blockMinimumX - roomCenterX) / halfRoomWidth
-            : roomCenterX > blockMaximumX
-              ? (roomCenterX - blockMaximumX) / halfRoomWidth
-              : 0,
-          0,
-          1,
-        );
-
-        for (let start = 0; start <= seatBlock.length - count; start += 1) {
-          const candidate = seatBlock.slice(start, start + count);
-          if (candidate.some((seat) => !seat.available || seat.selected)) {
-            continue;
-          }
-          if (!arePhysicallyContinuous(candidate, normalGap)) {
-            continue;
-          }
-
-          const candidateCenterX =
-            candidate.reduce((sum, seat) => sum + seat.x, 0) / candidate.length;
-          const horizontalDistance = clamp(
-            Math.abs(candidateCenterX - roomCenterX) / halfRoomWidth,
-            0,
-            1,
-          );
-          const maximumVerticalDistance = Math.max(
-            preference.targetRow,
-            1 - preference.targetRow,
-          );
-          const verticalDistance = clamp(
-            Math.abs(normalizedRow - preference.targetRow) / maximumVerticalDistance,
-            0,
-            1,
-          );
-          const score =
-            100 -
-            100 *
-              (horizontalDistance * preference.horizontalWeight +
-                verticalDistance * preference.verticalWeight);
-
-          candidates.push({
-            seats: candidate,
-            labels: candidate.map((seat) => seat.label),
-            row,
-            rowPosition: normalizedRow,
-            centerBlockDistance,
-            horizontalDistance,
-            verticalDistance,
-            score: Math.round(score * 10) / 10,
-          });
-        }
+      for (let start = 0; start <= rowSeats.length - count; start += 1) {
+        const group = rowSeats.slice(start, start + count);
+        if (group.some((seat) => !seat.available || seat.selected || seat.special ||
+          (!allowPremium && seatClass(seat) !== "standard") ||
+          (area === "central" && !isCentralSeat(seat)))) continue;
+        // Do not combine different ticket classes or bridge either main aisle.
+        if (group.some((seat) => seatClass(seat) !== seatClass(group[0]) ||
+          isCentralSeat(seat) !== isCentralSeat(group[0]))) continue;
+        const normalGap = gapFor.get(`${seatClass(group[0])}:${isCentralSeat(group[0])}`);
+        if (!arePhysicallyContinuous(group, normalGap)) continue;
+        const offsets = group.map((seat) => Math.abs(seat.x - centerX) / halfWidth);
+        const averageOffset = offsets.reduce((sum, value) => sum + value, 0) / count;
+        const worstOffset = Math.max(...offsets);
+        const penalty = ROW_PENALTIES[row] + 68 * averageOffset + 12 * worstOffset;
+        candidates.push({seats: group, labels: group.map((seat) => seat.label), row,
+          score: Math.round(clamp(100 - penalty, 0, 100) * 10) / 10,
+          penalty, seatClass: seatClass(group[0])});
       }
     }
-
-    candidates.sort(
-      (left, right) =>
-        (preference.centerBlockFirst
-          ? left.centerBlockDistance - right.centerBlockDistance
-          : 0) ||
-        right.score - left.score ||
-        left.centerBlockDistance - right.centerBlockDistance ||
-        left.horizontalDistance - right.horizontalDistance ||
-        left.verticalDistance - right.verticalDistance ||
-        left.row.localeCompare(right.row) ||
-        left.seats[0].number - right.seats[0].number,
-    );
-
+    candidates.sort((a, b) => a.penalty - b.penalty ||
+      IMAX_ROWS.indexOf(a.row) - IMAX_ROWS.indexOf(b.row) || a.seats[0].number - b.seats[0].number);
     return candidates[0] || null;
   }
 
   function numericStyle(element, property) {
-    const inlineValue = Number.parseFloat(element.style[property]);
-    if (Number.isFinite(inlineValue)) {
-      return inlineValue;
-    }
-
-    const computedValue = Number.parseFloat(window.getComputedStyle(element)[property]);
-    if (Number.isFinite(computedValue)) {
-      return computedValue;
-    }
-
+    // One coordinate system, including CSS transforms and different seat widths.
     const rectangle = element.getBoundingClientRect();
-    return property === "left" ? rectangle.left : rectangle.top;
+    return property === "left" ? rectangle.left + rectangle.width / 2 : rectangle.top + rectangle.height / 2;
   }
 
   function readSeatMap() {
@@ -357,6 +257,9 @@
         available: !special && !selected && !disabled,
         selected,
         special,
+        seatClass: wrapper.classList.contains("seat-grand-class") ? "grand" :
+          wrapper.classList.contains("seat-premium-class") ? "premium" :
+          seatClass(parsed),
         anchor,
         wrapper,
       });
@@ -461,101 +364,86 @@
     });
   }
 
-  function currentPerformanceId() {
-    const parameters = new URLSearchParams(window.location.search);
-    const queryId = parameters.get("performanceId") || parameters.get("eventId");
-    if (queryId) {
-      return queryId;
+  function performanceIdFromLocation(locationLike) {
+    const hash = String(locationLike.hash || "");
+    const queries = [hash.includes("?") ? hash.slice(hash.indexOf("?") + 1) : "", locationLike.search || ""];
+    for (const query of queries) {
+      const params = new URLSearchParams(query);
+      const id = params.get("performanceId") || params.get("eventId");
+      if (id) return id.trim();
     }
-
-    const pathParts = window.location.pathname.split("/").filter(Boolean);
-    const transactionIndex = pathParts.lastIndexOf("transaction");
-    return transactionIndex >= 0 ? pathParts[transactionIndex + 1] || "" : "";
+    // The site's older entry links use /transaction/<numeric performance id>.
+    // Ignore opaque transaction UUIDs; they differ across tabs for the same performance.
+    const entry = String(locationLike.pathname || "").match(/\/transaction\/(\d{6,})(?:\/|$)/);
+    if (entry) return entry[1];
+    return "";
   }
 
-  function rememberTargetTheater() {
-    const performanceId = currentPerformanceId();
-    if (!performanceId) {
-      return;
+  function currentPerformanceId() {
+    const fromUrl = performanceIdFromLocation(window.location);
+    if (fromUrl) {
+      try { window.sessionStorage.setItem("odyrush.performance.v2", JSON.stringify({id: fromUrl, path: window.location.pathname})); } catch { /* optional */ }
+      return fromUrl;
     }
-
-    try {
-      if (performanceId.startsWith(TARGET_PERFORMANCE_PREFIX)) {
-        window.sessionStorage.setItem(TARGET_SESSION_KEY, "1");
-      } else {
-        window.sessionStorage.removeItem(TARGET_SESSION_KEY);
-      }
-    } catch {
-      // The visible venue name remains the fallback when storage is unavailable.
+    if (isSeatRoute(window.location.hash) || isTicketRoute(window.location)) {
+      try {
+        const stored = JSON.parse(window.sessionStorage.getItem("odyrush.performance.v2") || "null");
+        if (stored?.path === window.location.pathname) return stored.id || "";
+      } catch { /* optional */ }
     }
+    return "";
   }
 
   function isSeatRoute(hash) {
     return /^#\/purchase\/seat(?:[/?]|$)/i.test(String(hash || ""));
   }
 
+  function isTicketRoute(locationLike) {
+    return /^#\/purchase\/ticket(?:[/?]|$)/i.test(String(locationLike.hash || "")) ||
+      /\/purchase\/ticket(?:\/|$)/i.test(String(locationLike.pathname || ""));
+  }
+
   function isTicketDestination(rawHref, baseHref) {
     try {
       const url = new URL(rawHref, baseHref);
-      return url.hostname === TARGET_HOST || url.hostname === MEMBER_LOGIN_HOST;
-    } catch {
-      return false;
-    }
-  }
-
-  function rememberTargetIntent() {
-    try {
-      if (typeof GM_setValue === "function") {
-        GM_setValue(TARGET_INTENT_KEY, Date.now());
-      }
-    } catch {
-      // The performance id and visible venue name remain fallbacks.
-    }
-  }
-
-  function hasRecentTargetIntent() {
-    try {
-      if (typeof GM_getValue !== "function") {
-        return false;
-      }
-      const markedAt = Number(GM_getValue(TARGET_INTENT_KEY, 0));
-      return Date.now() - markedAt < TARGET_INTENT_TTL_MILLISECONDS;
-    } catch {
-      return false;
-    }
+      return url.protocol === "https:" && (url.hostname === TARGET_HOST || url.hostname === MEMBER_LOGIN_HOST);
+    } catch { return false; }
   }
 
   function isTargetSeatPage() {
-    const seatPage = document.querySelector("app-purchase-seat");
-    if (!seatPage) {
-      return false;
-    }
-
-    if (TARGET_VENUE_PATTERN.test(seatPage.textContent)) {
-      return true;
-    }
-
-    try {
-      return window.sessionStorage.getItem(TARGET_SESSION_KEY) === "1";
-    } catch {
-      return false;
-    }
+    const page = document.querySelector("app-purchase-seat");
+    if (!page || !isSeatRoute(window.location.hash)) return false;
+    const id = currentPerformanceId();
+    if (id && !id.startsWith(TARGET_PERFORMANCE_PREFIX)) return false;
+    if (TARGET_VENUE_PATTERN.test(page.textContent)) return true;
+    return isTargetTransaction();
   }
 
   function isTargetTransaction() {
-    if (currentPerformanceId().startsWith(TARGET_PERFORMANCE_PREFIX)) {
-      return true;
-    }
+    const id = currentPerformanceId();
+    if (id) return id.startsWith(TARGET_PERFORMANCE_PREFIX);
+    return managedTab !== null && isRecent(managedTab.createdAt, MANAGED_TAB_TTL);
+  }
 
-    if (isSeatRoute(window.location.hash) && hasRecentTargetIntent()) {
-      return true;
-    }
+  function isRecent(timestamp, ttl) {
+    const age = Date.now() - Number(timestamp);
+    return Number.isFinite(age) && age >= 0 && age < ttl;
+  }
 
+  function completionKey(performanceId) {
+    return `${AUTO_SUCCESS_KEY}.${encodeURIComponent(performanceId)}`;
+  }
+
+  function recentlyCompletedThisPerformance(performanceId) {
+    if (!performanceId) return false;
     try {
-      return window.sessionStorage.getItem(TARGET_SESSION_KEY) === "1";
-    } catch {
-      return false;
-    }
+      return isRecent(window.localStorage.getItem(completionKey(performanceId)), AUTO_SUCCESS_TTL_MILLISECONDS);
+    } catch { return false; }
+  }
+
+  function rememberAutomaticSuccess(performanceId) {
+    if (!performanceId) return;
+    try { window.localStorage.setItem(completionKey(performanceId), String(Date.now())); } catch { /* optional */ }
   }
 
   function isTargetScheduleLocation(hostname, pathname) {
@@ -573,19 +461,11 @@
   }
 
   function normalizedSettings(saved) {
-    const defaults = {
-      count: 2,
-      preference: "balanced",
-      autoSelect: true,
-      autoCloseFailures: true,
-    };
     const count = Number(saved?.count);
-    const preference = PREFERENCES[saved?.preference]
-      ? saved.preference
-      : defaults.preference;
     return {
       count: Number.isInteger(count) && count >= 1 && count <= MAX_SEATS ? count : 2,
-      preference,
+      area: saved?.area === "all" ? "all" : "central",
+      allowPremium: saved?.allowPremium === true,
       autoSelect: saved?.autoSelect !== false,
       autoCloseFailures: saved?.autoCloseFailures !== false,
     };
@@ -634,9 +514,8 @@
     if (existingPanel?.dataset.mode === mode) {
       return;
     }
-    if (existingPanel) {
-      existingPanel.remove();
-    }
+    activePanel?.dispose();
+    existingPanel?.remove();
 
     ensurePageStyles();
 
@@ -646,7 +525,7 @@
     const shadow = host.attachShadow({ mode: "open" });
     const settings = loadSettings();
     const seatMode = mode === "seat";
-    const state = { running: false, canStop: false, runToken: 0 };
+    const state = { running: false, canStop: false, runToken: 0, disposed: false, controller: null };
 
     shadow.innerHTML = `
       <style>
@@ -680,7 +559,7 @@
           color: #fff;
           background: #343840;
         }
-        .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+        .actions { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 14px; }
         button {
           min-height: 38px;
           border: 0;
@@ -717,14 +596,20 @@
           <input id="count" type="number" min="1" max="${MAX_SEATS}" step="1" value="${settings.count}">
         </div>
         <div class="field">
-          <label for="preference">偏好</label>
-          <select id="preference">
-            <option value="balanced">默认（中央区域优先）</option>
-            <option value="center">严格居中</option>
-            <option value="back">靠后</option>
-            <option value="front">相对靠前（仍避开前区）</option>
+          <label for="area">选座区域</label>
+          <select id="area">
+            <option value="central">中央区域（蓝框 G–R 排）</option>
+            <option value="all">全场（包含前排和两侧）</option>
           </select>
         </div>
+        <div class="field">
+          <label for="premium">高级座位</label>
+          <select id="premium">
+            <option value="false">关闭：仅普通座位</option>
+            <option value="true">允许 Premium / Grand（需加价）</option>
+          </select>
+        </div>
+
         <div class="field">
           <label for="auto-select">自动选座</label>
           <select id="auto-select">
@@ -742,21 +627,20 @@
         ${
           seatMode
             ? `<div class="actions">
-                <button id="analyze" class="secondary" type="button">分析座位</button>
-                <button id="auto" type="button">自动选座并进入下一步</button>
+                <button id="auto" type="button">自动分析并选座</button>
                 <button id="stop" class="stop" type="button" disabled>停止</button>
               </div>`
             : ""
         }
         <div id="status" class="status" role="status" aria-live="polite">${
           seatMode
-            ? "已识别座位页，可以开始分析。"
+            ? "正在等待 IMAX 12 号厅座位表加载。"
             : "预设面板已启动；人数和偏好会自动保存。"
         }</div>
         <div class="note">${
           seatMode
-            ? "前区不选；Grand/Premium Class 可选。自动模式会勾选利用规约。"
-            : "Ctrl+点击购票链接会由脚本托管；只自动关闭明确的失败页。"
+            ? "优先 M 排附近中轴座位；选座后自动勾选利用规约并进入票种页。"
+            : "Ctrl+点击购票链接会由脚本托管；仅自动关闭托管的后台失败页。"
         }</div>
       </section>
     `;
@@ -764,14 +648,15 @@
     document.body.appendChild(host);
 
     const countInput = shadow.getElementById("count");
-    const preferenceSelect = shadow.getElementById("preference");
+    const areaSelect = shadow.getElementById("area");
+    const premiumSelect = shadow.getElementById("premium");
     const autoSelectInput = shadow.getElementById("auto-select");
     const autoCloseInput = shadow.getElementById("auto-close");
-    const analyzeButton = shadow.getElementById("analyze");
     const autoButton = shadow.getElementById("auto");
     const stopButton = shadow.getElementById("stop");
     const statusBox = shadow.getElementById("status");
-    preferenceSelect.value = settings.preference;
+    areaSelect.value = settings.area;
+    premiumSelect.value = String(settings.allowPremium);
     autoSelectInput.value = String(settings.autoSelect);
     autoCloseInput.value = String(settings.autoCloseFailures);
 
@@ -780,12 +665,10 @@
       if (!Number.isInteger(count) || count < 1 || count > MAX_SEATS) {
         throw new Error(`人数必须是 1 到 ${MAX_SEATS} 的整数。`);
       }
-      const preference = PREFERENCES[preferenceSelect.value]
-        ? preferenceSelect.value
-        : "balanced";
       const options = {
         count,
-        preference,
+        area: areaSelect.value,
+        allowPremium: premiumSelect.value === "true",
         autoSelect: autoSelectInput.value === "true",
         autoCloseFailures: autoCloseInput.value === "true",
       };
@@ -800,12 +683,10 @@
 
     function renderBusyState() {
       countInput.disabled = state.running;
-      preferenceSelect.disabled = state.running;
+      areaSelect.disabled = state.running;
+      premiumSelect.disabled = state.running;
       autoSelectInput.disabled = state.running;
       autoCloseInput.disabled = state.running;
-      if (analyzeButton) {
-        analyzeButton.disabled = state.running;
-      }
       if (autoButton) {
         autoButton.disabled = state.running;
       }
@@ -820,7 +701,7 @@
         throw new Error("尚未识别到座位表，请等页面加载完成后重试。若一直如此，请提供页面 HTML。");
       }
 
-      const recommendation = findBestSeats(seats, options.count, options.preference);
+      const recommendation = findBestSeats(seats, options.count, options);
       if (!recommendation) {
         const availableCount = seats.filter((seat) => seat.available).length;
         throw new Error(
@@ -831,34 +712,40 @@
       return { seats, recommendation };
     }
 
-    function analyze() {
-      try {
-        const options = readOptions();
-        const { recommendation } = recommendationFor(options);
-        highlightRecommendation(recommendation);
-        setStatus(
-          `推荐 ${recommendation.labels.join("、")}，综合评分 ${recommendation.score}。`,
-          "success",
-        );
-      } catch (error) {
-        clearRecommendation();
-        setStatus(error.message, "error");
-      }
+    function dispose() {
+      state.disposed = true;
+      state.runToken += 1;
+      state.controller?.abort();
+      clearRecommendation();
+    }
+    activePanel = { host, dispose };
+
+    async function waitForSeatMap(runToken) {
+      let previous = "";
+      let stableSince = Date.now();
+      setStatus("等待 IMAX 12 号厅座位表加载完成…");
+      await waitFor(() => {
+        if (!isTargetSeatPage()) throw new Error("座位页已变化，已停止。");
+        const issue = blockingPageIssue();
+        if (issue) throw new Error(issue);
+        const seats = readSeatMap();
+        const signature = JSON.stringify(seats.map(({label, x, y, available, selected, seatClass}) =>
+          [label, x, y, available, selected, seatClass]));
+        if (signature !== previous) { previous = signature; stableSince = Date.now(); }
+        return isTheater12Map(seats) && Date.now() - stableSince >= 500;
+      }, 30000, runToken, state).catch((error) => {
+        if (error.message === "等待页面状态更新超时。") {
+          throw new Error("座位表未加载完成或不符合池袋 IMAX 12 号厅布局，请检查页面后重试。");
+        }
+        throw error;
+      });
     }
 
-    async function autoSelectAndContinue() {
-      if (state.running) {
-        return false;
-      }
-
+    async function autoSelectAndContinue(runToken) {
       let succeeded = false;
-      state.running = true;
-      state.canStop = true;
-      state.runToken += 1;
-      const runToken = state.runToken;
-      renderBusyState();
 
       try {
+        await waitForSeatMap(runToken);
         const options = readOptions();
         const initialSeats = readSeatMap();
         const initiallySelected = initialSeats.filter((seat) => seat.selected);
@@ -922,9 +809,12 @@
         }
         await waitFor(() => termsCheckbox.checked, 1000, runToken, state);
 
-        const nextButton = document.querySelector(
+        const nextButton = await waitFor(() => {
+          const button = document.querySelector(
           'app-purchase-seat form button[type="submit"]',
-        );
+          );
+          return button && !button.disabled ? button : null;
+        }, 3000, runToken, state);
         if (
           !nextButton ||
           nextButton.disabled ||
@@ -944,7 +834,7 @@
 
         await waitFor(
           () =>
-            window.location.pathname.includes("/purchase/ticket") ||
+            isTicketRoute(window.location) ||
             [...document.querySelectorAll("h1")].some((heading) =>
               /券種選択/.test(heading.textContent || ""),
             ) ||
@@ -970,73 +860,59 @@
         } else {
           setStatus(error.message || "发生未知错误，已停止。", "error");
         }
-      } finally {
-        state.running = false;
-        state.canStop = false;
-        renderBusyState();
       }
 
       return succeeded;
     }
 
-    function recentlyCompletedThisPerformance(performanceId) {
-      try {
-        const record = JSON.parse(
-          window.localStorage.getItem(AUTO_SUCCESS_KEY) || "null",
-        );
-        return (
-          record?.performanceId === performanceId &&
-          Date.now() - Number(record.completedAt) < AUTO_SUCCESS_TTL_MILLISECONDS
-        );
-      } catch {
-        return false;
-      }
-    }
-
-    function rememberAutomaticSuccess(performanceId) {
-      try {
-        window.localStorage.setItem(
-          AUTO_SUCCESS_KEY,
-          JSON.stringify({ performanceId, completedAt: Date.now() }),
-        );
-      } catch {
-        // The cross-tab lock still prevents simultaneous selection.
-      }
-    }
-
-    async function automaticallySelectOnce() {
-      const performanceId = currentPerformanceId() || "grand-cinema-sunshine";
-      if (recentlyCompletedThisPerformance(performanceId)) {
-        setStatus("已有标签页完成过本场次自动选座，本页保留且不会重复执行。", "success");
+    async function runSelection(automatic = false) {
+      if (state.running || state.disposed) return;
+      const performanceId = currentPerformanceId();
+      if (automatic && !performanceId) {
+        setStatus("无法确认场次编号，未自动执行；确认场次后可点击按钮选座。", "error");
         return;
       }
-
       if (!window.navigator.locks?.request) {
-        setStatus("浏览器不支持多标签执行锁，请手动点击自动选座按钮。", "error");
+        setStatus("浏览器不支持多标签执行锁，请使用支持 Web Locks 的 Chrome。", "error");
         return;
       }
-
-      await window.navigator.locks.request(
-        "odyrush-seat-selection",
-        { ifAvailable: true },
-        async (lock) => {
-          if (!lock) {
-            setStatus("另一个标签页正在自动选座，本页保持不操作。", "success");
-            return;
-          }
-          if (recentlyCompletedThisPerformance(performanceId)) {
-            setStatus("另一个标签页已经完成本场次选座，本页不会重复执行。", "success");
-            return;
-          }
-
-          document.title = `🎟️ 自动选座中 | ${document.title}`;
-          const completed = await autoSelectAndContinue();
-          if (completed) {
-            rememberAutomaticSuccess(performanceId);
-            document.title = `✅ 已进入下一步 | ${document.title}`;
-          }
-        },
-      );
+      state.running = true;
+      state.canStop = true;
+      state.runToken += 1;
+      const runToken = state.runToken;
+      state.controller = new AbortController();
+      renderBusyState();
+      setStatus("等待同场次标签完成；若对方失败，本页将接替选座…");
+      try {
+        // Queue instead of ifAvailable: a failed tab releases the lock to the next waiter.
+        // Unknown identities require an explicit click and never write a shared completion record.
+        await window.navigator.locks.request(
+          `odyrush-seat-selection:${performanceId || "manual-unknown"}`,
+          { signal: state.controller.signal },
+          async () => {
+            if (state.disposed || runToken !== state.runToken) return;
+            if (currentPerformanceId() !== performanceId || !isTargetSeatPage()) {
+              throw new Error("场次或页面已变化，请重新执行。");
+            }
+            if (performanceId && recentlyCompletedThisPerformance(performanceId)) {
+              setStatus("已有标签完成本场次选座，15 分钟内不重复执行。请前往该标签继续购票。", "success");
+              return;
+            }
+            const completed = await autoSelectAndContinue(runToken);
+            if (completed) {
+              rememberAutomaticSuccess(performanceId);
+              document.title = `✅ 已进入下一步 | ${document.title}`;
+            }
+          },
+        );
+      } catch (error) {
+        if (!state.disposed) setStatus(error.name === "AbortError" ? "已取消等待。" : error.message, "error");
+      } finally {
+        state.running = false;
+        state.canStop = false;
+        state.controller = null;
+        renderBusyState();
+      }
     }
 
     function saveChangedOptions() {
@@ -1051,16 +927,17 @@
     }
 
     countInput.addEventListener("change", saveChangedOptions);
-    preferenceSelect.addEventListener("change", saveChangedOptions);
+    areaSelect.addEventListener("change", saveChangedOptions);
+    premiumSelect.addEventListener("change", saveChangedOptions);
     autoSelectInput.addEventListener("change", saveChangedOptions);
     autoCloseInput.addEventListener("change", saveChangedOptions);
-    analyzeButton?.addEventListener("click", analyze);
-    autoButton?.addEventListener("click", autoSelectAndContinue);
+    autoButton?.addEventListener("click", () => runSelection(false));
     stopButton?.addEventListener("click", () => {
       if (!state.running || !state.canStop) {
         return;
       }
       state.runToken += 1;
+      state.controller?.abort();
       state.canStop = false;
       renderBusyState();
       setStatus("正在停止…");
@@ -1069,48 +946,62 @@
     renderBusyState();
     if (seatMode && settings.autoSelect) {
       setStatus("已识别座位页，正在启动后台自动选座…");
-      window.queueMicrotask(automaticallySelectOnce);
+      window.queueMicrotask(() => runSelection(true));
     }
+  }
+
+  async function readTabData() {
+    if (typeof GM_getTab !== "function") return {};
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => resolve({}), 1500);
+      GM_getTab((tab) => { window.clearTimeout(timer); resolve(tab || {}); });
+    });
+  }
+
+  async function initializeManagedTab() {
+    const tab = await readTabData();
+    if (tab.odyrush && isRecent(tab.odyrush.createdAt, MANAGED_TAB_TTL)) managedTab = tab.odyrush;
+    const launch = window.location.hash.match(/^#odyrush-open=([a-f0-9-]+)$/i);
+    if (!isTargetSchedulePage() || !launch || typeof GM_getValue !== "function" || typeof GM_saveTab !== "function") return false;
+    const key = LAUNCH_KEY + launch[1];
+    const record = GM_getValue(key, null);
+    if (!record || !isRecent(record.createdAt, 60000) || !isTicketDestination(record.href, window.location.href)) return false;
+    tab.odyrush = {createdAt: Date.now(), token: launch[1]};
+    await new Promise((resolve) => GM_saveTab(tab, resolve));
+    if (typeof GM_deleteValue === "function") GM_deleteValue(key);
+    // A same-site bridge records tab provenance; the actual ticket/auth URL is untouched.
+    window.location.replace(record.href);
+    return true;
   }
 
   let controlledOpenerInstalled = false;
   function installControlledBackgroundOpener() {
-    if (controlledOpenerInstalled || typeof GM_openInTab !== "function") {
-      return;
-    }
+    if (controlledOpenerInstalled || typeof GM_openInTab !== "function") return;
     controlledOpenerInstalled = true;
-
-    document.addEventListener(
-      "click",
-      (event) => {
-        if (!event.ctrlKey || event.button !== 0) {
-          return;
-        }
-        if (!(event.target instanceof Element)) {
-          return;
-        }
-
-        const anchor = event.target.closest("a[href]");
-        if (!anchor || !isTicketDestination(anchor.href, window.location.href)) {
-          return;
-        }
-
+    document.addEventListener("click", (event) => {
+      if (!isTargetSchedulePage() || !event.ctrlKey || event.button !== 0 || !(event.target instanceof Element)) return;
+      const anchor = event.target.closest("a[href]");
+      if (!anchor || !isTicketDestination(anchor.href, window.location.href)) return;
+      if (typeof GM_getTab !== "function" || typeof GM_saveTab !== "function" || typeof GM_setValue !== "function") return;
+      const token = window.crypto.randomUUID();
+      const key = LAUNCH_KEY + token;
+      try {
+        GM_setValue(key, {href: anchor.href, createdAt: Date.now()});
+        GM_openInTab(`https://www.cinemasunshine.co.jp/theater/gdcs/#odyrush-open=${token}`, {active: false, setParent: true});
         event.preventDefault();
         event.stopImmediatePropagation();
-        rememberTargetIntent();
-        GM_openInTab(anchor.href, { active: false, setParent: true });
-      },
-      true,
-    );
+        window.setTimeout(() => { if (typeof GM_deleteValue === "function") GM_deleteValue(key); }, 60000);
+      } catch (error) { console.error("OdyRush: 托管打开失败，保留浏览器默认点击行为。", error); }
+    }, true);
   }
 
   function detectKnownFailure(locationLike, pageText = "") {
     if (locationLike.hostname === TARGET_HOST) {
       const hash = String(locationLike.hash || "").toLowerCase();
-      if (hash.startsWith("#/error")) {
+      if (/^#\/error(?:[/?]|$)/.test(hash)) {
         return { code: "error", label: "购票错误" };
       }
-      if (hash.startsWith("#/congestion")) {
+      if (/^#\/congestion(?:[/?]|$)/.test(hash)) {
         return { code: "congestion", label: "访问拥堵" };
       }
     }
@@ -1125,103 +1016,79 @@
     return null;
   }
 
-  let tabCloseScheduled = false;
-  function requestCurrentTabClose() {
-    if (tabCloseScheduled) {
-      return;
-    }
-    tabCloseScheduled = true;
-    window.close();
-    window.setTimeout(() => window.close(), 1000);
+  function shouldCloseFailure({failure, autoCloseFailures, visibilityState, managed, performanceId}) {
+    return Boolean(failure && autoCloseFailures && visibilityState === "hidden" &&
+      managed && isRecent(managed.createdAt, MANAGED_TAB_TTL) &&
+      (!performanceId || performanceId.startsWith(TARGET_PERFORMANCE_PREFIX)));
   }
 
   function handleKnownFailurePage() {
-    const failure = detectKnownFailure(
-      window.location,
-      document.body?.innerText || "",
-    );
-    if (!failure) {
-      return false;
-    }
-
-    document.title = `❌ ${failure.label}`;
-    if (loadSettings().autoCloseFailures) {
-      requestCurrentTabClose();
-    }
+    const failure = detectKnownFailure(window.location, document.body?.innerText || "");
+    if (!failure) return false;
+    const title = `❌ ${failure.label}`;
+    if (document.title !== title) document.title = title;
+    if (shouldCloseFailure({failure, autoCloseFailures: loadSettings().autoCloseFailures,
+      visibilityState: document.visibilityState, managed: managedTab, performanceId: currentPerformanceId()})) window.close();
     return true;
   }
 
-  function start() {
-    if (
-      window.location.hostname !== TARGET_HOST &&
-      window.location.hostname !== MEMBER_LOGIN_HOST &&
-      !TARGET_SCHEDULE_HOSTS.has(window.location.hostname)
-    ) {
-      return;
-    }
-
-    window.addEventListener("hashchange", handleKnownFailurePage);
-    if (window.onurlchange === null) {
-      window.addEventListener("urlchange", handleKnownFailurePage);
-    }
-    if (handleKnownFailurePage()) {
-      return;
-    }
-
-    if (isTargetSchedulePage()) {
-      installControlledBackgroundOpener();
-    }
-
-    if (window.location.hostname === MEMBER_LOGIN_HOST) {
-      const loginObserver = new MutationObserver(() => {
-        if (handleKnownFailurePage()) {
-          loginObserver.disconnect();
-        }
-      });
-      loginObserver.observe(document.documentElement, { childList: true, subtree: true });
-      return;
-    }
-
-    if (window.location.hostname === TARGET_HOST) {
-      rememberTargetTheater();
-    }
-
-    let mountScheduled = false;
-    let observer;
-    const tryMount = () => {
-      if (mountScheduled) {
-        return;
-      }
-      mountScheduled = true;
+  async function start() {
+    if (window.location.hostname !== TARGET_HOST && window.location.hostname !== MEMBER_LOGIN_HOST &&
+      !TARGET_SCHEDULE_HOSTS.has(window.location.hostname)) return;
+    if (await initializeManagedTab()) return;
+    if (!document.body) await new Promise((resolve) => document.addEventListener("DOMContentLoaded", resolve, {once: true}));
+    installControlledBackgroundOpener();
+    let scheduled = false;
+    let panelContext = "";
+    const refresh = () => {
+      if (scheduled) return;
+      scheduled = true;
       window.queueMicrotask(() => {
-        mountScheduled = false;
-        if (TARGET_SCHEDULE_HOSTS.has(window.location.hostname)) {
-          if (isTargetSchedulePage()) {
-            rememberTargetIntent();
-            mountPanel("settings");
-            observer?.disconnect();
-          }
-          return;
+        scheduled = false;
+        const failure = handleKnownFailurePage();
+        const mode = failure ? "" : isTargetSchedulePage() ? "settings" :
+          isTargetSeatPage() ? "seat" : isTargetTransaction() && window.location.hostname === TARGET_HOST &&
+          !isTicketRoute(window.location) ? "settings" : "";
+        const context = `${mode}:${currentPerformanceId()}`;
+        if (activePanel && (context !== panelContext || !activePanel.host.isConnected)) {
+          activePanel.dispose();
+          activePanel.host.remove();
+          activePanel = null;
         }
-
-        rememberTargetTheater();
-        if (isTargetSeatPage()) {
-          mountPanel("seat");
-          observer?.disconnect();
-        } else if (isTargetTransaction()) {
-          mountPanel("settings");
-        }
+        panelContext = context;
+        if (mode) mountPanel(mode);
       });
     };
-
-    tryMount();
-    observer = new MutationObserver(tryMount);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    const observer = new MutationObserver(refresh);
+    observer.observe(document.documentElement, {childList: true, subtree: true});
+    window.addEventListener("hashchange", refresh);
+    window.addEventListener("popstate", refresh);
+    if (window.onurlchange === null) window.addEventListener("urlchange", refresh);
+    document.addEventListener("visibilitychange", handleKnownFailurePage);
+    window.addEventListener("pagehide", () => { activePanel?.dispose(); observer.disconnect(); });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) {
+        activePanel?.host.remove();
+        activePanel = null;
+        observer.observe(document.documentElement, {childList: true, subtree: true});
+        refresh();
+      }
+    });
+    refresh();
   }
+
 
   return {
     MAX_SEATS,
-    PREFERENCES,
+    IMAX_ROWS,
+    ROW_PENALTIES,
+    seatClass,
+    isCentralSeat,
+    isTheater12Map,
+    performanceIdFromLocation,
+    isTicketRoute,
+    shouldCloseFailure,
+    completionKey,
     arePhysicallyContinuous,
     findBestSeats,
     hasExcludedSeatClass,
@@ -1231,7 +1098,6 @@
     isTicketDestination,
     normalizedSettings,
     parseSeatLabel,
-    splitIntoSeatBlocks,
     typicalSeatGap,
     start,
   };

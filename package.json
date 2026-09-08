@@ -1,9 +1,9 @@
 {
   "name": "odyrush",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "private": true,
   "description": "Grand Cinema Sunshine 池袋选座辅助用户脚本",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   }
 }
