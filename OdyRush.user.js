@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OdyRush - Grand Cinema Sunshine
 // @namespace    https://github.com/wjin999/OdyRush
-// @version      0.6.0
+// @version      0.6.1
 // @description  按池袋 IMAX 12 号厅布局自动分析并选择连座，支持中央区域/全场和高级座位开关。
 // @author       OdyRush
 // @match        https://transaction.ticket-cinemasunshine.com/*
@@ -35,7 +35,7 @@
 })(function odyRushFactory() {
   "use strict";
 
-  const VERSION = "0.6.0";
+  const VERSION = "0.6.1";
   const TARGET_HOST = "transaction.ticket-cinemasunshine.com";
   const MEMBER_LOGIN_HOST = "login.member.cinemasunshine.co.jp";
   const TARGET_SCHEDULE_HOSTS = new Set([
@@ -598,30 +598,30 @@
         <div class="field">
           <label for="area">选座区域</label>
           <select id="area">
-            <option value="central">中央区域（蓝框 G–R 排）</option>
-            <option value="all">全场（包含前排和两侧）</option>
+            <option value="central">中央区域</option>
+            <option value="all">全场</option>
           </select>
         </div>
         <div class="field">
           <label for="premium">高级座位</label>
           <select id="premium">
-            <option value="false">关闭：仅普通座位</option>
-            <option value="true">允许 Premium / Grand（需加价）</option>
+            <option value="false">关闭</option>
+            <option value="true">开启</option>
           </select>
         </div>
 
         <div class="field">
           <label for="auto-select">自动选座</label>
           <select id="auto-select">
-            <option value="true">进入后自动执行</option>
-            <option value="false">仅手动执行</option>
+            <option value="true">开启</option>
+            <option value="false">关闭</option>
           </select>
         </div>
         <div class="field">
           <label for="auto-close">失败标签</label>
           <select id="auto-close">
-            <option value="true">后台自动关闭</option>
-            <option value="false">保留标签</option>
+            <option value="true">自动关闭</option>
+            <option value="false">保留</option>
           </select>
         </div>
         ${
@@ -751,7 +751,7 @@
         const initiallySelected = initialSeats.filter((seat) => seat.selected);
         if (initiallySelected.length > 0) {
           throw new Error(
-            `页面已有选中座位（${initiallySelected.map((seat) => seat.label).join("、")}），请先手动取消，避免误选。`,
+            "页面已有选中座位，请先手动取消后重试。",
           );
         }
 
